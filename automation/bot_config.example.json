@@ -1,0 +1,6 @@
+{
+  "admins": ["U_OWNER_PLACEHOLDER"],
+  "self_mid": "U_BOT_PLACEHOLDER",
+  "mention": "@mybot",
+  "model": "grok-4.7-low-fast"
+}
