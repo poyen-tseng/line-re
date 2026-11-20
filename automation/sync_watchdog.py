@@ -23,6 +23,12 @@ Inspection failure and PID changes reset continuity. Socket destruction is
 opt-in only: the parent's live trial removed CLOSE-WAIT but did not reconnect.
 When enabled it runs once per stall, allows a grace period, then retains the
 restart fallback. No global TCP settings or live process memory are changed.
+
+Native Windows: sockets come from `netstat -ano -p tcp` (owning PID per
+row), the UI nudge clicks the 聊天 tab through UI Automation, and a
+"restart" only re-launches LINE.exe, which re-shows the running client.
+LINE is never killed there: without Auto-Login a killed client comes back
+at the login screen and the in-memory message cache is gone.
 """
 import ipaddress
 import math
@@ -32,6 +38,8 @@ import signal
 import subprocess
 import sys
 import time
+
+import platform_compat as pc
 
 DEFAULT_NETS = ("147.92.0.0/16", "43.223.0.0/16")
 OPEN_LINE = "/workspace/line-bottles/open-line.sh"
@@ -83,9 +91,47 @@ def _log(msg):
     print(f"[watchdog {ts}] {msg}", file=sys.stderr, flush=True)
 
 
+def _windows_conn_states(pid, nets):
+    """`line_conn_states` from netstat's per-row owning PID (Windows)."""
+    try:
+        result = subprocess.run(["netstat", "-ano", "-p", "tcp"], capture_output=True,
+                                text=True, encoding="utf-8", errors="replace", timeout=10,
+                                creationflags=pc.no_window_flags())
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode:
+        return None
+    states = {"ESTABLISHED": "ESTAB", "CLOSE_WAIT": "CLOSE-WAIT"}
+    r = dict(core_estab=0, core_closewait=set(), core_other=[], estab_443=0)
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[0].upper() != "TCP" or parts[-1] != str(pid):
+            continue
+        local, peer, state = parts[1], parts[2], states.get(parts[3].upper(), parts[3].upper())
+        host, _, port = peer.rpartition(":")
+        try:
+            ip = ipaddress.ip_address(host.strip("[]"))
+        except ValueError:
+            continue
+        if ip.is_loopback or ip.is_unspecified:
+            continue
+        if state == "ESTAB" and port == "443":
+            r["estab_443"] += 1
+        if port == "443" and any(ip in n for n in nets):
+            if state == "ESTAB":
+                r["core_estab"] += 1
+            elif state == "CLOSE-WAIT":
+                r["core_closewait"].add((local, peer))
+            else:
+                r["core_other"].append(state)
+    return r
+
+
 def line_conn_states(pid, nets):
     """Return dict(core_estab, core_closewait=set of (local,peer),
     core_other=[states], estab_443) for pid, or None if ss failed."""
+    if pc.IS_WINDOWS:
+        return _windows_conn_states(pid, nets)
     try:
         result = subprocess.run(["ss", "-Htanpe"], capture_output=True, text=True,
                                 timeout=10)
@@ -211,6 +257,12 @@ def restart_line(display=":3", pid=None):
     if pid is None or lc.find_line_pid(pid) != pid:
         _log("restart: target PID disappeared; waiting for rediscovery")
         return False
+    if pc.IS_WINDOWS:
+        import win_line
+        ok = win_line.launch_line(pid)
+        _log(f"restart: Windows LINE pid={pid} re-shown via LINE.exe "
+             f"(not killed): {'ok' if ok else 'LINE.exe not found'}")
+        return ok
     pids = _bottles_line_pids(pid)
     _log(f"restart: SIGTERM bottles/wine LINE tree pids={pids}")
     for p, identity in pids.items():
@@ -258,6 +310,20 @@ def ui_nudge(display=":3"):
     Takes the senders' UI lock so it never interleaves with a send.
     Returns True if the click was issued.
     """
+    if pc.IS_WINDOWS:
+        try:
+            import line_common as lc
+            import send_message as sm
+            import win_line
+            pid = lc.find_line_pid()
+            if not pid:
+                _log("ui-nudge: LINE is not running")
+                return False
+            with sm._ui_lock():
+                return win_line.nudge(pid)
+        except (OSError, RuntimeError, TimeoutError) as exc:
+            _log(f"ui-nudge failed: {exc}")
+            return False
     try:
         import send_message as sm
         picked = sm.pick_main_window(display)
@@ -385,6 +451,14 @@ class SyncWatchdog:
             self.stall_since = self.nudged_at = self.last_check = None
         if not self.enabled or pid is None:
             self.stall_since = self.nudged_at = None
+            if self.enabled and pid is None and self.restart and pc.IS_WINDOWS:
+                # Windows: LINE was closed (not just hidden). Start it, rate-limited.
+                now = time.monotonic()
+                if now - getattr(self, "_last_launch", -1e18) >= max(60.0, self.check_every):
+                    self._last_launch = now
+                    import win_line
+                    _log("LINE.exe is not running; launching it: "
+                         + ("ok" if win_line.launch_line() else "LINE.exe not found"))
             return False
         now = time.monotonic()
         if self.last_check is not None and now - self.last_check < self.check_every:
@@ -397,6 +471,12 @@ class SyncWatchdog:
             return False
         cw = res["core_closewait"]
         stalled = res["core_estab"] == 0
+        if pc.IS_WINDOWS:
+            # Native LINE 26.6 keeps idle 147.92/16 sockets in CLOSE_WAIT for
+            # hours while its live channel stays ESTAB on another :443 host
+            # and messages keep arriving; tab clicks never reopen a core
+            # socket. There, only "no ESTAB :443 at all" is a stall.
+            stalled = stalled and res["estab_443"] == 0
         desc = (f"pid={pid} core_estab={res['core_estab']} "
                 f"core_closewait={len(cw)} core_other={res['core_other']} "
                 f"estab_443={res['estab_443']}")

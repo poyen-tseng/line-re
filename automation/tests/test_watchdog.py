@@ -7,6 +7,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from platform_support import linux_path  # noqa: E402
 import sync_watchdog as wd
 
 R = dict(restart=True, stall_secs=90, cooldown_secs=300, ui_nudge=False)
@@ -17,6 +19,7 @@ def states(estab=0, cw=()):
     return dict(core_estab=estab, core_closewait=set(cw), core_other=[], estab_443=0)
 
 
+@linux_path
 class SocketParsingTests(unittest.TestCase):
     def inspect(self, output, inodes=None, rc=0):
         result = SimpleNamespace(returncode=rc, stdout=output)
@@ -259,6 +262,7 @@ class ThreadTests(unittest.TestCase):
         self.assertIsNone(dog._thread)
 
 
+@linux_path
 class UiNudgeTests(unittest.TestCase):
     def test_click_only_under_ui_lock_no_typing(self):
         import contextlib

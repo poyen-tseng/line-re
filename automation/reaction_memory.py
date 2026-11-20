@@ -91,7 +91,7 @@ def widget_global(mem, obj):
 class ReactionMemory:
     def __init__(self, pid):
         self.pid = pid
-        self.mem = open(f'/proc/{pid}/mem', 'rb', buffering=0)
+        self.mem = lc.open_process_mem(pid)
         try:
             cached = lc._open_chat_cache.get(pid)
             self.base = cached[0] if cached else lc._image_base(pid, self.mem)
@@ -201,6 +201,44 @@ def evidence_from_blob(blob, message_id, room, self_mid):
     return found, bool(ack)
 
 
+def _self_nice(status, self_mid):
+    items = status.get('reactionList') if isinstance(status, dict) else None
+    return isinstance(items, list) and any(
+        isinstance(item, dict) and item.get('reactor') == self_mid and item.get('type') == 1
+        and item.get('cancel', False) is False and item.get('PredefinedType') == 2
+        for item in items)
+
+
+def row_evidence_from_blob(blob, message_id, room, self_mid):
+    """Windows LINE 26.6: the reaction lives in the message's own `_message`
+    leaf row (a `reactionList` JSON column). The same complete row binds the
+    id, room and reactor, so no nearby heap bytes are combined."""
+    if message_id.encode() not in blob:
+        return []
+    found = []
+    for match in re.finditer(b'\x0d\x00\x00', blob):
+        page = blob[match.start():match.start() + lc.PGSZ]
+        if message_id.encode() not in page:
+            continue
+        for _, values in lc.parse_leaf_table_page(page):
+            values = lc.normalize_own_row(values)
+            if not (lc.looks_like_message_row(values) and values[lc.MSG_ID] == message_id
+                    and values[lc.MSG_TO] == room):
+                continue
+            for value in values:
+                if not (isinstance(value, str) and '"reactionList"' in value):
+                    continue
+                try:
+                    status = json.loads(value)
+                except ValueError:
+                    continue
+                if _self_nice(status, self_mid):
+                    found.append(dict(id=message_id, room=room, reactor=self_mid, predefined=2,
+                                      source='SQLite:_message.reactionStatus',
+                                      offset=match.start(), room_bound=True))
+    return found
+
+
 def message_identity_from_blob(blob, message_id, room):
     """Room for an id-only UPDATE must come from a complete message record."""
     if message_id.encode() not in blob:
@@ -287,13 +325,18 @@ def reaction_evidence(pid, message_id, room, self_mid):
     found = []
     ack = False
     identity = False
+    persisted = []
     clicks, completions = [], []
-    with open(f'/proc/{pid}/mem', 'rb', buffering=0) as mem:
+    with lc.open_process_mem(pid) as mem:
         for addr, blob in chunks(pid, mem):
             rows, ok = evidence_from_blob(blob, message_id, room, self_mid)
             for row in rows:
                 row['address'] = hex(addr + row.pop('offset'))
             found.extend(rows)
+            for row in row_evidence_from_blob(blob, message_id, room, self_mid):
+                row['address'] = hex(addr + row.pop('offset'))
+                row.pop('room_bound')
+                persisted.append(row)
             ack = ack or ok
             identity = identity or message_identity_from_blob(blob, message_id, room)
             click_events, done_events = completion_logs(blob)
@@ -304,5 +347,9 @@ def reaction_evidence(pid, message_id, room, self_mid):
         if not row.pop('room_bound'):
             row['source'] += '+message-record:room'
     completed = correlated_completion(found, clicks, completions, message_id)
-    return dict(confirmed=bool(found and (ack or completed)), records=found,
-                server_ack=ack, client_success=completed)
+    # The Windows client writes no SQL/log text for reactions; its persisted
+    # message row is the evidence there (see row_evidence_from_blob).
+    row_ok = bool(persisted) and lc.pc.IS_WINDOWS
+    return dict(confirmed=bool((found and (ack or completed)) or row_ok),
+                records=found + (persisted if lc.pc.IS_WINDOWS else []),
+                server_ack=ack, client_success=completed, persisted_row=bool(persisted))

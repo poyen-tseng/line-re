@@ -9,7 +9,6 @@ be a secret location (hidden components, keys, browser profiles, Bottles
 prefixes, and similar).
 """
 import fnmatch
-import fcntl
 from functools import wraps
 import json
 import math
@@ -22,6 +21,7 @@ from datetime import datetime, timedelta
 
 import line_common as lc
 import operator_commands
+import platform_compat as pc
 
 ACTION_TYPES = (
     "send_text",
@@ -54,6 +54,9 @@ _SECRET_BITS = (
     "firefox",
     "brave",
     "microsoft-edge",
+    # Native Windows: the user registry hive. AppData is handled in
+    # is_secret_path (everything but its Temp folder is off-limits).
+    "ntuser.dat",
 )
 _SECRET_SUFFIXES = (".env", ".pem", ".key")
 
@@ -105,6 +108,13 @@ def is_secret_path(path):
         if low.endswith(_SECRET_SUFFIXES):
             return True
     folded = "/".join(parts).lower()
+    # Windows profiles keep browser data, LINE's own store, CLI tokens and
+    # DPAPI keys under AppData. Only its Temp folder (staging) is ordinary.
+    low_parts = [part.lower() for part in parts]
+    if "appdata" in low_parts:
+        i = low_parts.index("appdata")
+        if low_parts[i + 1:i + 3] != ["local", "temp"]:
+            return True
     return any(bit in folded for bit in _SECRET_BITS)
 
 
@@ -314,8 +324,13 @@ def resolve_send_file(raw_path, roots, max_mb):
 
 
 def wine_path(linux_path):
-    """Logical Z: mapping; Flatpak may hide the host path. Uploads stage on C:."""
+    """Logical Z: mapping; Flatpak may hide the host path. Uploads stage on C:.
+
+    Native Windows needs no mapping: the picker takes the path as-is.
+    """
     ap = os.path.abspath(linux_path)
+    if pc.IS_WINDOWS:
+        return ap
     return "Z:" + ap.replace("/", "\\")
 
 
@@ -497,8 +512,7 @@ def _transaction(method):
     def locked(self, *args, **kwargs):
         path = os.fspath(self.path) + ".lock"
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        with open(path, "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+        with pc.locked_path(path):
             return method(self, *args, **kwargs)
     return locked
 

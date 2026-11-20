@@ -12,6 +12,8 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from platform_support import linux_path  # noqa: E402
 import ai_backend
 import line_cli as cli
 import reaction_memory as rm
@@ -63,6 +65,7 @@ class ReactionFilterTests(unittest.TestCase):
             self.assertTrue(cli.build_parser().parse_args(['ai', '--group-bot']).no_react)
 
 
+@linux_path
 class EvidenceTests(unittest.TestCase):
     def test_binary_noise_is_not_scanned_with_the_log_regex(self):
         blob = b'L1234567890 invalid timestamp ' * 100000
@@ -362,6 +365,7 @@ class OrderingTests(unittest.TestCase):
                 worker.close()
 
 
+@linux_path
 class UIGuardTests(unittest.TestCase):
     @unittest.skipUnless(os.environ.get('DISPLAY'), 'DISPLAY is not set')
     def test_read_only_capture_on_available_display(self):

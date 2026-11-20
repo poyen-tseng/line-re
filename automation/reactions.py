@@ -12,6 +12,7 @@ import time
 
 import bot_config
 import line_common as lc
+import platform_compat as pc
 import reaction_memory as rm
 import send_message as sm
 import watch_messages as watch
@@ -131,6 +132,8 @@ def like_message(message, chat_name, self_mid, preempt, mention_token=DEFAULT_ME
     """
     if not is_tagged(message, self_mid, mention_token):
         return Result(detail='message is not an incoming tagged group command')
+    if pc.IS_WINDOWS:
+        return like_message_windows(message, chat_name, self_mid, preempt)
     mid, room = message['id'], message['to']
     pid = lc.find_line_pid()
     if not pid:
@@ -259,6 +262,50 @@ def like_message(message, chat_name, self_mid, preempt, mention_token=DEFAULT_ME
         print(f'[react] timing id={mid} method=ui-picker ' +
               ' '.join(f'{name}={value:.3f}s' for name, value in timings.items()),
               file=sys.stderr, flush=True)
+
+
+def like_message_windows(message, chat_name, self_mid, preempt):
+    """Native Windows like. LINE shows its reaction button only on a real
+    mouse hover; Qt ignores synthesized background mouse input, so this
+    needs an unlocked, idle desktop. Anything else returns without a click.
+    """
+    import win_line
+    if win_line.desktop_locked():
+        return Result(detail='desktop locked: LINE reactions need a real mouse hover; skipped')
+    mid, room = message['id'], message['to']
+    pid = lc.find_line_pid()
+    if not pid:
+        return Result(detail='LINE is not running')
+    try:
+        if rm.reaction_evidence(pid, mid, room, self_mid)['records']:
+            return Result(ok=True, committed=True, detail='existing self NICE in memory; no click')
+        _msgs, contacts, _s, _m = lc.scan_memory(pid)
+        sender = contacts.get(message.get('from'))
+        min_idle = float(os.environ.get('LINE_LIKE_MIN_IDLE', '30'))
+
+        def guard():
+            if preempt.is_set():
+                raise TimeoutError('yielding UI to reply')
+            if lc.current_open_chat_mid(pid) != room:
+                raise ValueError('open room changed or is unknown')
+
+        with sm._ui_lock(timeout=0.5), win_line.session():
+            committed, detail = win_line.like_hover(pid, room, sender, message.get('text'),
+                                                     guard, min_idle=min_idle,
+                                                     log=lambda *a, **k: None)
+    except (OSError, ValueError, TimeoutError, RuntimeError) as exc:
+        return Result(detail=str(exc))
+    if not committed:
+        return Result(detail=detail)
+    until = time.monotonic() + 8
+    while True:
+        evidence = rm.reaction_evidence(pid, mid, room, self_mid)
+        if evidence['confirmed']:
+            return Result(True, True, 'NICE=2 self=' + self_mid + ' room=' + room
+                          + ' evidence=' + evidence['records'][0]['source'])
+        if time.monotonic() >= until:
+            return Result(committed=True, detail='click sent; memory confirmation unavailable')
+        time.sleep(0.5)
 
 
 @dataclass

@@ -11,6 +11,8 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from platform_support import linux_path  # noqa: E402
 import ai_backend
 import group_actions as ga
 import line_cli as cli
@@ -162,6 +164,7 @@ class RoutingTests(unittest.TestCase):
         self.assertRegex(lines[1], r"^\d\d:\d\d:\d\d\.\d{3} bc$")
 
 
+@linux_path
 class SendTests(unittest.TestCase):
     def setUp(self):
         self.ctx = dict(display=':test', wid='fake', pid=123, target=ROOM, msg_input=(1, 1))

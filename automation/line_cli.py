@@ -69,6 +69,7 @@ import bot_config
 import coding_jobs
 import operator_commands
 import vm_control
+import platform_compat as pc
 
 # OTP / verification-code messages are never fed as actionable text and
 # never receive a drafted reply.
@@ -318,9 +319,9 @@ def build_parser():
                            "--group-bot (legacy newline or version-2 JSON) so restarts do "
                            "not re-reply")
     p_ai.add_argument("--commander", default=DEFAULT_COMMANDER_MID,
-                      help="only this mid may command --group-bot; "
-                           "empty or 'any' = anyone who @-mentions "
-                           "(default: anyone)")
+                      help="only this mid (or comma-separated mids) may "
+                           "command --group-bot; empty or 'any' = anyone "
+                           "who @-mentions (default: anyone)")
     p_ai.add_argument('--admin', action='append', help='operator admin user MID; repeatable; replaces config/default admins')
     p_ai.add_argument('--bot-config', default=str(bot_config.DEFAULT_PATH), help='local persisted reply model/admin config')
     p_ai.add_argument('--jobs-root', default=coding_jobs.DEFAULT_ROOT, help='isolated coding workdirs and durable control records')
@@ -340,6 +341,21 @@ def build_parser():
     p_ai.add_argument("--include-dm", action="store_true",
                       help="with --group-bot, also accept an @-mention in "
                            "a 1:1 chat (default: groups only)")
+    p_ai.add_argument("--dm-without-mention", action="store_true",
+                      help="with --include-dm: a 1:1 message from an allowed "
+                           "sender is a command without an @-mention "
+                           "(groups still require one)")
+    p_ai.add_argument("--room-plugin", action="append", dest="room_plugins",
+                      default=None, metavar="PY",
+                      help="Python file that may claim rooms "
+                           "(handles_room/is_allowed_sender/"
+                           "handle_group_command). Repeatable. Default: "
+                           "bot_config.json room_plugins")
+    p_ai.add_argument("--log-file", default=None, metavar="F",
+                      help="append stdout/stderr here (for a detached "
+                           "daemon, e.g. pythonw.exe on Windows)")
+    p_ai.add_argument("--pid-file", default=None, metavar="F",
+                      help="write this process id here at startup")
     p_ai.add_argument("--cooldown", type=float, default=10.0,
                       help="per-group minimum seconds between --group-bot "
                            "replies; a hit inside the window is skipped "
@@ -897,7 +913,7 @@ def _reply_prompt(m, messages, contacts, self_mid, system, limit):
 
 
 def _would_send_cmd(chat, text, room=None):
-    cmd = [".venv/bin/python", "line_cli.py", "send"]
+    cmd = [sys.executable if pc.IS_WINDOWS else ".venv/bin/python", "line_cli.py", "send"]
     if room:
         cmd.extend(["--room", room])
     if chat:
@@ -971,6 +987,16 @@ def _confirm_route(pid, self_mid, room, text, started_ms):
 
 def _log_window():
     """Print the LINE window send would target. Does not focus or click."""
+    if pc.IS_WINDOWS:
+        try:
+            import win_line
+            pid = lc.find_line_pid()
+            with win_line.session():
+                found = win_line.main_window(pid, restore=False) if pid else None
+            print(f"[ai] LINE window: {found or 'not found'} pid={pid}", file=sys.stderr)
+        except (OSError, RuntimeError) as exc:
+            print(f"[ai] LINE window: unavailable ({exc})", file=sys.stderr)
+        return
     display = lc.find_line_display()
     if not display:
         print("[ai] LINE window: not found", file=sys.stderr)
@@ -1220,7 +1246,33 @@ _mention_info = reactions.mention_info
 _mention_path = reactions.mention_path
 
 
-def _command_text(m, self_mid, token):
+def _self_mention_tokens(self_mid, token, contacts=None):
+    """`@name` tokens for this account, longest first.
+
+    The configured token plus every display name seen for `self_mid`
+    in this LINE session (contacts and the live profile), so a renamed
+    bot's `@<new name>` is still stripped from the command text.
+    """
+    names = []
+    if isinstance(token, str) and token.strip():
+        names.append(token.strip())
+    if isinstance(contacts, dict):
+        for mid, name in contacts.items():
+            if _mid_eq(mid, self_mid) and isinstance(name, str):
+                names.append(name)
+    names.extend(getattr(lc.scan_memory, "self_names", None) or ())
+    tokens = []
+    for name in names:
+        name = name.strip()
+        if not name:
+            continue
+        tok = name if name.startswith("@") else "@" + name
+        if tok != "@" and tok not in tokens:
+            tokens.append(tok)
+    return sorted(tokens, key=len, reverse=True)
+
+
+def _command_text(m, self_mid, token, contacts=None):
     """Message text with this bot's @-mention removed."""
     text = m.get("text") or ""
     info = _mention_info(m.get("contentMeta")) or []
@@ -1239,11 +1291,85 @@ def _command_text(m, self_mid, token):
                 continue
             encoded = candidate
     text = encoded.decode("utf-16le")
-    if token and token in text:
-        text = text.replace(token, " ")
+    for tok in _self_mention_tokens(self_mid, token, contacts):
+        if tok in text:
+            text = text.replace(tok, " ")
     text = text.replace("\r", " ")
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
+
+_PLUGIN_CACHE = {}
+
+
+def _room_plugin_paths(args):
+    paths = getattr(args, "room_plugins", None)
+    if paths is None:
+        try:
+            paths = bot_config.BotConfig(getattr(args, "bot_config", bot_config.DEFAULT_PATH)
+                                         ).get("room_plugins") or []
+        except bot_config.ConfigError:
+            paths = []
+    return [os.path.abspath(os.path.expanduser(p)) for p in paths]
+
+
+def _load_plugin(path):
+    """Import a room plugin file, reloaded when its mtime changes."""
+    import importlib.util
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    cached = _PLUGIN_CACHE.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    try:
+        name = "line_room_plugin_" + re.sub(r"\W", "_", os.path.splitext(os.path.basename(path))[0])
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception as exc:  # a broken plugin must not stop the bot
+        print(f"[ai] room plugin {path} failed to load: {exc}", file=sys.stderr)
+        _PLUGIN_CACHE[path] = (mtime, None)
+        return None
+    _PLUGIN_CACHE[path] = (mtime, module)
+    return module
+
+
+def _plugin_fn(module, *names):
+    for name in names:
+        fn = getattr(module, name, None)
+        if callable(fn):
+            return fn
+    return None
+
+
+def _room_plugin(args, room):
+    """First plugin that claims `room`, or None.
+
+    A plugin defines `handles_room(room_mid)` (or `is_meet_room`),
+    `is_allowed_sender(user_mid)` (or `is_meet_commander`) and
+    `handle_group_command(**kw)` returning (actions, source, truncated).
+    Actions run through the same verified executor as model actions.
+    """
+    if not room or not room.startswith("c"):
+        return None
+    for path in _room_plugin_paths(args):
+        module = _load_plugin(path)
+        claims = module and _plugin_fn(module, "handles_room", "is_meet_room")
+        try:
+            if claims and claims(room):
+                return module
+        except Exception as exc:
+            print(f"[ai] room plugin {path} handles_room failed: {exc}", file=sys.stderr)
+    return None
+
+
+def _commanders(args):
+    raw = (args.commander or "").strip()
+    if not raw or raw.lower() == "any":
+        return []
+    return [c.strip() for c in raw.split(",") if c.strip()]
 
 
 def _groupbot_decision(m, args, contacts):
@@ -1258,13 +1384,30 @@ def _groupbot_decision(m, args, contacts):
         return "LINE official/system sender", None
     if m.get("contentType") == 18:
         return "system event", None
-    commander = (args.commander or "").strip().lower()
-    if commander and commander != "any" and not _mid_eq(frm, args.commander):
+    plugin = _room_plugin(args, to)
+    if plugin is not None:
+        # The plugin's own sender list replaces --commander in its rooms.
+        allowed = _plugin_fn(plugin, "is_allowed_sender", "is_meet_commander")
+        if not allowed or not allowed(frm):
+            return "not commander", None
+        info = _mention_info(m.get("contentMeta")) or ()
+        if any(_mid_eq(mid, args.self_mid) for mid, _s, _e in info):
+            return None, "metadata"
+        return "not mentioned", None
+    commanders = _commanders(args)
+    if commanders and not any(_mid_eq(frm, c) for c in commanders):
         return "not commander", None
     is_group = to.startswith("c")
     if not is_group and not (args.include_dm and to.startswith("u")):
         return "not a group", None
     path = _mention_path(m, args.self_mid, args.mention)
+    if not path and _mention_info(m.get("contentMeta")) is None:
+        # No MENTION metadata: also accept any known display name of this bot.
+        text = m.get("text") or ""
+        if any(tok in text for tok in _self_mention_tokens(args.self_mid, args.mention, contacts)):
+            path = "text"
+    if not path and not is_group and getattr(args, "dm_without_mention", False):
+        return None, "dm"
     if not path:
         return "not mentioned", None
     return None, path
@@ -1366,6 +1509,39 @@ def _reply_prompt_section(m, messages, contacts, pid=None):
             f"{lc.fmt_time(original['createdTime'])} Asia/Taipei: {lc.truncate(body, 8000)}\n\n")
 
 
+_NET_TIME = {"at": 0.0, "text": ""}
+
+
+def _network_time_note(sys_now):
+    """One line comparing this clock to an HTTPS `Date` header, or "".
+
+    Cached for 10 minutes. Only shown when they differ by over a minute,
+    so the model can answer time questions when the host clock is wrong.
+    """
+    if time.monotonic() - _NET_TIME["at"] < 600:
+        return _NET_TIME["text"]
+    import email.utils
+    import urllib.request
+    text = ""
+    for url in ("https://line.me", "https://www.google.com"):
+        try:
+            req = urllib.request.Request(url, method="HEAD")
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                header = resp.headers.get("Date")
+            if not header:
+                continue
+            net = email.utils.parsedate_to_datetime(header).astimezone(sys_now.tzinfo)
+            diff = (sys_now - net).total_seconds()
+            if abs(diff) > 60:
+                text = (f"實際網路時間（HTTP Date, UTC+8）：{ga.iso8(net)}（本機時鐘"
+                        f"{'快' if diff > 0 else '慢'} {abs(diff):.0f} 秒；以網路時間為準）\n")
+            break
+        except Exception:
+            continue
+    _NET_TIME.update(at=time.monotonic(), text=text)
+    return text
+
+
 def _group_prompt(command, m, messages, contacts, self_mid, system, limit,
                   chat_name="", reply_pid=None):
     who = lc.display_name(m.get("from"), contacts)
@@ -1379,6 +1555,7 @@ def _group_prompt(command, m, messages, contacts, self_mid, system, limit,
         head
         + "你是 LINE 群組裡的助理。使用者用 @ 標記你並下達指令。\n"
         f"現在時間（Asia/Taipei, UTC+8）：{now_s}\n"
+        + _network_time_note(now)
         + _group_roster_text(m.get("to"), chat_name)
         + "（問到加入幾個群組、有哪些群組時，依上面的清單回答。）\n"
         "你只能輸出一個 JSON 物件，不要 markdown、不要解釋、不要呼叫工具。\n"
@@ -2010,7 +2187,7 @@ def _group_bot_handle_inner(messages, contacts, seen, args, group_map, gx, st):
                 seen.discard(mid)
                 return
 
-        command = _command_text(m, args.self_mid, args.mention)
+        command = _command_text(m, args.self_mid, args.mention, contacts)
         chat_name = _resolve_room_name(m, contacts, group_map, args.self_mid) or ""
         who = lc.display_name(m.get("from"), contacts)
         if getattr(st, "on_command", None):
@@ -2024,11 +2201,28 @@ def _group_bot_handle_inner(messages, contacts, seen, args, group_map, gx, st):
         try:
             t_grok = time.time()
             actions = operator_commands.parse_command(command)
+            plugin = _room_plugin(args, room)
             if actions is not None:
                 source, truncated, raw = 'explicit', False, ''
                 if reactor:
                     reactor.submit(m, chat_name)
                     reactor.reply_ready(mid)
+            elif plugin is not None:
+                raw = ''
+                now_dt = ga.now_taipei()
+                if reactor:
+                    reactor.submit(m, chat_name)
+                actions, source, truncated = plugin.handle_group_command(
+                    command=command, m=m, messages=messages, contacts=contacts,
+                    self_mid=args.self_mid, limit=args.limit, chat_name=chat_name,
+                    dry_run=args.dry_run, call_fn=_call,
+                    transcript=_group_transcript(messages, m, contacts, args.self_mid, args.limit),
+                    now_s=ga.iso8(now_dt), net_note=_network_time_note(now_dt),
+                    max_actions=args.max_actions)
+                if reactor:
+                    reactor.reply_ready(mid)
+                print(f"[ai] room plugin handled id={mid} room={room} source={source} "
+                      f"actions={len(actions)}", file=sys.stderr)
             else:
                 print(f"[ai] grok start id={mid}", file=sys.stderr)
                 prompt = _group_prompt(
@@ -2175,9 +2369,17 @@ def _group_bot(args):
     tested). Anyone who @-mentions is obeyed (or only `--commander` if set), and only when this account
     is @-mentioned. `--dry-run` does not call send.
     """
+    if getattr(args, "log_file", None):
+        path = os.path.abspath(args.log_file)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        stream = open(path, "a", encoding="utf-8", errors="replace", buffering=1)
+        sys.stdout = sys.stderr = stream
+    if getattr(args, "pid_file", None):
+        lc.atomic_write_text(os.path.abspath(args.pid_file), f"{os.getpid()}\n")
     bad = _validate_group_bot(args)
     if bad:
         return bad
+    lc.set_self_mid(args.self_mid)
     if not getattr(args, "no_log_stamps", False):
         _install_stamps()
     group_map = _load_group_map(args.group_map)
@@ -2389,6 +2591,10 @@ def cmd_ai(args):
 
 
 def main(argv=None):
+    if pc.IS_WINDOWS:
+        for stream in (sys.stdout, sys.stderr):
+            if stream is not None and hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
     ap = build_parser()
     args = ap.parse_args(argv)
     for name in ("interval", "min_interval", "cooldown", "watchdog_stall_secs",
@@ -2398,6 +2604,8 @@ def main(argv=None):
             ap.error(f"--{name.replace('_', '-')} must be finite and >= 0")
     if getattr(args, "limit", 0) is not None and getattr(args, "limit", 0) < 0:
         ap.error("--limit must be >= 0")
+    if getattr(args, "self_mid", None):
+        lc.set_self_mid(args.self_mid)
     try:
         return args.func(args)
     except watch_messages.StateError as exc:

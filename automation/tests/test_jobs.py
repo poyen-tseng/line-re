@@ -11,6 +11,8 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from platform_support import needs_symlinks, posix_only  # noqa: E402
 import bot_config as bc
 import coding_jobs as jobs
 import line_cli as cli
@@ -39,6 +41,7 @@ class JobTests(unittest.TestCase):
             time.sleep(.05)
         self.fail('job failed to finish')
 
+    @posix_only
     def test_detached_persist_complete_files_and_notify_once_after_restart(self):
         row = self.start("import time; from pathlib import Path; time.sleep(.2); Path('result.py').write_text('print(42)'); print('done')", command_id='message-1')
         self.assertNotEqual(os.getsid(row['worker_pid']), os.getsid(0))
@@ -111,6 +114,7 @@ print(json.dumps(r))
         self.assertIsNone(jobs.JobStore(self.temp.name).claim_notification())
         self.assertEqual(self.store.load(row['id'])['notification'], 'unconfirmed')
 
+    @needs_symlinks
     def test_secrets_and_output_symlinks_rejected_and_repo_permission_trusted(self):
         with self.assertRaisesRegex(jobs.JobError, '憑證'):
             self.store.start(ROOM, '', bc.DEFAULT_ADMIN, 'api_key=sk-example-12345678901234567890')
@@ -147,6 +151,7 @@ print(json.dumps(r))
         attach.assert_called_once()
         self.assertEqual(self.store.load(row['id'])['notification'], 'notified')
 
+    @posix_only
     def test_dead_supervisor_fails_and_cleans_up_orphan_agent(self):
         row = self.start('import time; time.sleep(60)')
         running_path = self.store.control(row['id']) / 'running.json'

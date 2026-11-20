@@ -76,7 +76,7 @@ def scan_message_id(pid, mid, timeout=0.75, max_bytes=64 * 1024 * 1024):
     deadline = time.monotonic() + timeout
     consumed = 0
     needle = mid.encode('ascii')
-    with open(f'/proc/{pid}/mem', 'rb', buffering=0) as mem:
+    with lc.open_process_mem(pid) as mem:
         for lo, hi, _ in lc.iter_readable_regions(pid, writable_only=True):
             pos, overlap = lo, b''
             while pos < hi:

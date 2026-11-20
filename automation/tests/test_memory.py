@@ -11,6 +11,8 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from platform_support import linux_path  # noqa: E402
 import line_common as lc
 import read_messages as reader
 
@@ -27,6 +29,7 @@ def message(**changes):
     return row
 
 
+@linux_path
 class MemoryTests(unittest.TestCase):
     def test_open_chat_discovery_requires_one_object_for_each_anchor(self):
         base, address = 0x140000000, 0x20000
