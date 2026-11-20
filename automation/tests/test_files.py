@@ -4,6 +4,8 @@ import sys
 import unittest
 from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from platform_support import linux_path, posix_only  # noqa: E402
 import line_common as lc
 
 SELF = 'u' + '1' * 32
@@ -31,6 +33,7 @@ import file_upload as fu
 import send_message as sm
 import line_cli as cli
 
+@linux_path
 class UploadTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -50,10 +53,12 @@ class UploadTests(unittest.TestCase):
         row.update(changes)
         return row
 
+    @posix_only  # POSIX paths / O_NOFOLLOW Wine staging
     def test_mapping_backslashes_and_original_extension(self):
         self.assertEqual(fu.windows_path(str(self.prefix/'drive_c'/'a b.mp4'),str(self.prefix)), 'C:\\a b.mp4')
         self.assertEqual(ga.wine_path('/workspace/測試 a.mp4'), 'Z:\\workspace\\測試 a.mp4')
 
+    @posix_only
     def test_staging_preserves_unicode_bytes_and_cleans_success(self):
         with patch.object(fu,'prefix_for_pid',return_value=str(self.prefix)):
             with fu.staged_file(str(self.source),1,1000) as staged:
@@ -63,6 +68,7 @@ class UploadTests(unittest.TestCase):
                 self.assertTrue(staged['wine'].startswith('C:\\line-uploads\\'))
             self.assertFalse(dest.exists())
 
+    @posix_only
     def test_staging_retains_after_possible_commit_exception(self):
         with patch.object(fu,'prefix_for_pid',return_value=str(self.prefix)):
             with self.assertRaises(OSError):
@@ -71,6 +77,7 @@ class UploadTests(unittest.TestCase):
                     raise OSError('X11 disconnected after click')
             self.assertTrue(dest.exists())
 
+    @posix_only
     def test_staging_refuses_oversize_and_symlink(self):
         with patch.object(fu,'prefix_for_pid',return_value=str(self.prefix)):
             with self.assertRaises(OSError):
@@ -101,6 +108,7 @@ class UploadTests(unittest.TestCase):
         with patch.object(lc,'find_line_pid',return_value=1), patch.object(lc,'scan_memory',return_value=(rows,{},0,0)):
             self.assertIsNone(fu.verify(1,SELF,ROOM,90,set(),str(self.source),self.source.stat().st_size,0))
 
+    @posix_only  # POSIX paths / O_NOFOLLOW Wine staging
     def test_send_locks_selection_releases_for_verification_and_cleans(self):
         held=[]
         @contextmanager

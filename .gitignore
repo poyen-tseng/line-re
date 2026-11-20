@@ -30,3 +30,4 @@ groups.json
 groupbot_state.json
 schedules.json
 bot_config.json
+*.pid

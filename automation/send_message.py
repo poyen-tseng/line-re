@@ -37,18 +37,21 @@ Notes:
 The shared X-display autodetect / window-find logic lives in
 `line_common.py`; this script keeps the X11 UI-automation helpers and
 the send-specific CLI.
+
+Native Windows LINE Desktop: `run` hands the same verified-room send to
+`win_line.send_text` (UI Automation instead of X11 coordinates). The
+room checks before paste and before Enter are identical.
 """
 import argparse
 from contextlib import contextmanager
-import fcntl
 import os
 import re
 import subprocess
 import sys
 import time
-import tempfile
 
 import line_common as lc
+import platform_compat as pc
 
 # Only these return codes prove the send never reached its commit step.
 SAFE_RETRY_CODES = frozenset((2, 3, 4))
@@ -58,21 +61,13 @@ SEND_UNCERTAIN = 6
 @contextmanager
 def _ui_lock(timeout=15, name="ui"):
     """Serialize our senders' shared clipboard/focus/composer operations."""
-    path = os.path.join(tempfile.gettempdir(), f"line-{name}-{os.getuid()}.lock")
-    with open(path, "a") as lock:
-        deadline = time.monotonic() + timeout
-        while True:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f"another LINE sender holds the {name} lock")
-                time.sleep(0.1)
-        try:
+    try:
+        with pc.locked_path(pc.temp_lock_path(name), timeout=timeout):
             yield
-        finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
+    except TimeoutError as exc:
+        if "lock is held" in str(exc):
+            raise TimeoutError(f"another LINE sender holds the {name} lock") from None
+        raise
 
 # Window-relative coordinates for the standard LINE 26.x desktop layout
 # (742x806 AllInOneWindow). These are centers of the target widgets.
@@ -681,10 +676,27 @@ def _route_matches(ctx):
     return lc.current_open_chat_mid(ctx['pid']) == ctx['target']
 
 
+def _run_text_windows(args):
+    import win_line
+    pid = lc.find_line_pid()
+    if not pid:
+        print("ERROR: LINE.exe not running; cannot verify the open chat. "
+              "Aborting without sending.", file=sys.stderr)
+        return 4
+    target = _target_room(pid, args)
+    if not target:
+        return 4
+    # win_line maps UI failures before Enter to 3 (retryable) and at/after
+    # Enter to SEND_UNCERTAIN (never replayed).
+    return win_line.send_text(args, target)
+
+
 def _run_text(args):
     """Run the send operation with a parsed argparse Namespace. Returns
     an exit code (0 success, 2 no display, 3 no window, 4 route check
     failed — nothing was sent)."""
+    if pc.IS_WINDOWS:
+        return _run_text_windows(args)
     ctx, err = _prepare_chat(args)
     if err:
         return err

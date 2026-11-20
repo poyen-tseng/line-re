@@ -2,6 +2,9 @@
 
 Only the picker selection holds the shared UI lock. Copies are staged on C:
 inside the existing Wine prefix because the Flatpak cannot see /workspace.
+On native Windows the copy is staged in a private %TEMP% directory (UNC
+network paths included) and the Windows file picker is driven through UI
+Automation (`win_line.attach_file`); verification is shared.
 Nothing injects code, extracts credentials, or replays authenticated traffic.
 """
 from contextlib import contextmanager
@@ -20,15 +23,23 @@ import time
 import bot_config
 import group_actions as ga
 import line_common as lc
+import platform_compat as pc
 import send_message as sm
 
 DEFAULT_SELF = bot_config.DEFAULT_BOT_MID
 
 
 def default_file_roots():
-    """Search roots: /workspace and the current user's home directory."""
+    """Search roots: bot_config `file_roots` if set, else /workspace (Linux)
+    and the current user's home directory."""
+    try:
+        configured = bot_config.BotConfig().get('file_roots')
+    except bot_config.ConfigError:
+        configured = None
+    if configured:
+        return [os.path.expanduser(p) for p in configured]
     home = os.path.expanduser('~')
-    roots = ['/workspace']
+    roots = [] if pc.IS_WINDOWS else ['/workspace']
     if home and home not in roots:
         roots.append(home)
     return roots
@@ -210,6 +221,8 @@ def send(args):
         result.path = path
         result.size = os.stat(path).st_size
         _log('start', result, room, started)
+        if pc.IS_WINDOWS:
+            return _send_windows(args, result, path, room, max_mb, timeout)
         # One in-flight file verifier per account, without excluding text/scans.
         with sm._ui_lock(timeout=2, name='upload'):
             pid = lc.find_line_pid()
@@ -277,9 +290,73 @@ def send(args):
                 else:
                     result.status = 'uncertain'
                     result.detail = 'upload not confirmed before timeout; do not resend automatically'
-    except (OSError, ValueError, TimeoutError, sm.subprocess.SubprocessError) as exc:
+    except (OSError, ValueError, TimeoutError, RuntimeError, sm.subprocess.SubprocessError) as exc:
         result.status = 'uncertain' if result.committed else 'fail'
         result.detail = str(exc)
     finally:
         _log('ok' if result.status in ('ok','probe') else 'fail', result, room, started)
     return result
+
+
+def _send_windows(args, result, path, room, max_mb, timeout):
+    """Native Windows: stage, pick in the verified room, then verify in memory.
+
+    Raises like the Linux path; `send` maps exceptions to fail/uncertain.
+    """
+    import win_line
+    with sm._ui_lock(timeout=2, name='upload'):
+        pid = lc.find_line_pid()
+        if not pid:
+            raise OSError('LINE is not running')
+        target = sm._target_room(pid, args)
+        if not target:
+            result.detail = 'cannot resolve a verified room'
+            return result
+        staged, size, stage_dir = win_line.stage_copy(path, int(max_mb * 1024 * 1024))
+        retain = False
+        try:
+            result.size = size
+            result.uploaded_name = Path(staged).name
+            before, _, _, _ = lc.scan_memory(pid)
+            since = int(time.time() * 1000)
+            with sm._ui_lock():
+                if args.dry_run:
+                    with win_line.session():
+                        found = win_line.main_window(pid)
+                        opened = bool(found) and win_line.open_chat(
+                            pid, found[0], found[1], target, getattr(args, 'chat', '') or '')
+                    result.status = 'probe' if opened else 'fail'
+                    result.detail = ('dry-run; verified room, picker not opened' if opened
+                                     else 'cannot open verified room')
+                    return result
+
+                def commit():
+                    result.committed = True
+
+                with win_line.session():
+                    accepted, detail = win_line.attach_file(
+                        pid, target, getattr(args, 'chat', '') or '', staged,
+                        getattr(args, 'file_commit', True), commit)
+            if not accepted:
+                result.status = 'uncertain' if result.committed else 'fail'
+                result.detail = detail + ('; no automatic resend' if result.committed else '')
+                retain = result.committed
+                return result
+            if not getattr(args, 'file_commit', True):
+                result.status, result.detail = 'probe', detail
+                return result
+            row = verify(pid, getattr(args, 'self_mid', None) or configured_self_mid(), target,
+                         since, set(before), staged, size, timeout)
+            if row:
+                result.status = 'ok'
+                result.message_id = row['id']
+                result.content_type = row['contentType']
+                result.detail = 'new self attachment in requested room with server message ID'
+            else:
+                result.status = 'uncertain'
+                result.detail = 'upload not confirmed before timeout; do not resend automatically'
+                retain = True  # LINE may still be reading the staged copy
+            return result
+        finally:
+            if not retain:
+                shutil.rmtree(stage_dir, ignore_errors=True)

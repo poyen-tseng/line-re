@@ -2,9 +2,13 @@
 
 Agents run with the owner's privileges, not an OS sandbox. Control records
 live outside the agent cwd. Only explicit owner text permits repo access.
+
+Windows: workers start detached (new process group, no console), process
+identity is the creation time, cancellation kills the whole tree with
+`taskkill /T`, and agent CLIs start without cmd.exe so the task text is
+never re-parsed by a shell.
 """
 from contextlib import contextmanager
-import fcntl
 import json
 import math
 import os
@@ -19,8 +23,12 @@ import time
 import bot_config
 import group_actions as ga
 import line_common as lc
+import platform_compat as pc
 
-DEFAULT_ROOT = '/workspace/line-bot-jobs'
+REPO = Path(__file__).resolve().parent.parent
+DEFAULT_ROOT = (str(Path.home() / 'line-bot-jobs') if pc.IS_WINDOWS
+                else '/workspace/line-bot-jobs')
+REPO_NAME = str(REPO) if pc.IS_WINDOWS else '/workspace/line-re'
 DEFAULT_CODEX_MODEL = 'gpt-6.1-sol'  # gpt-6-luna-max is rejected on this ChatGPT account
 DEFAULT_BACKEND = 'cursor'
 DEFAULT_CURSOR_JOB_MODEL = 'grok-4.7-high-fast'
@@ -42,10 +50,12 @@ def safe_text(text, limit=1000):
 
 def repo_access_allowed(owner_command):
     # A mere path mention, a negation, or a model-invented permission is insufficient.
-    if re.search(r'(?:不要|禁止|不得|勿|不可|do not|never|don.t)[^\n。.!]{0,60}/workspace/line-re', owner_command, re.I):
+    names = {'/workspace/line-re', REPO_NAME}
+    repo = '(?:' + '|'.join(re.escape(n) for n in sorted(names)) + ')'
+    if re.search(r'(?:不要|禁止|不得|勿|不可|do not|never|don.t)[^\n。.!]{0,60}' + repo, owner_command, re.I):
         return False
-    return bool(re.search(r'(?:允許修改|允許編輯|allow edits to|modify|edit|fix)\s*/workspace/line-re(?=$|[\s/，,。:：])',
-                          owner_command, re.I))
+    return bool(re.search(r'(?:允許修改|允許編輯|allow edits to|modify|edit|fix)\s*' + repo
+                          + r'(?=$|[\s/\\，,。:：])', owner_command, re.I))
 
 
 def _read(path):
@@ -57,12 +67,8 @@ def _write(path, data):
 
 
 def process_token(pid):
-    try:
-        # comm may contain spaces or parentheses; fields after its final ')'.
-        fields = Path(f'/proc/{int(pid)}/stat').read_text().rsplit(')', 1)[1].split()
-        return None if fields[0] == 'Z' else fields[19]
-    except (OSError, ValueError, TypeError, IndexError):
-        return None
+    """Start-time identity of a live process; None when gone (PID reuse guard)."""
+    return pc.process_token(pid)
 
 
 def kill_agent(running):
@@ -71,6 +77,9 @@ def kill_agent(running):
         return
     if process_token(pid) != running.get('token'):
         return  # do not signal a reused PID
+    if os.name == 'nt':  # real OS: no process groups/signals
+        pc.kill_tree(pid, hard=True)
+        return
     try:
         os.killpg(pid, signal.SIGTERM)
         # Also kill surviving children if the leader exits during the grace.
@@ -85,7 +94,7 @@ class JobStore:
         self.root = Path(root).resolve()
         repo = Path(__file__).resolve().parent.parent
         if self.root == repo or repo in self.root.parents:
-            raise JobError('工作根目錄必須在 /workspace/line-re 之外')
+            raise JobError(f'工作根目錄必須在 {REPO_NAME} 之外')
         self.timeout = float(timeout)
         self.max_concurrent = int(max_concurrent)
         if not math.isfinite(self.timeout) or not 0 < self.timeout <= 86400 or not 1 <= self.max_concurrent <= 10:
@@ -94,8 +103,7 @@ class JobStore:
     @contextmanager
     def locked(self):
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with (self.root / '.jobs.lock').open('a') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+        with pc.locked_path(self.root / '.jobs.lock'):
             yield
 
     def control(self, jid):
@@ -186,8 +194,8 @@ class JobStore:
             'Create and test the requested deliverables there. Never read, print, or include credentials, '
             'tokens, authentication files or private keys in prompts, logs, replies or output files. '
             'Do not send LINE messages, control the desktop, or modify bot job control files. '
-            + ('The owner explicitly requested work on /workspace/line-re; only the requested repo edits are allowed. '
-               if repo_allowed else 'Do not read or modify /workspace/line-re or its runtime data. Keep all project changes inside your cwd. ')
+            + (f'The owner explicitly requested work on {REPO_NAME}; only the requested repo edits are allowed. '
+               if repo_allowed else f'Do not read or modify {REPO_NAME} or its runtime data. Keep all project changes inside your cwd. ')
             + 'End with a short summary, tests and output filenames.\n\nOwner task:\n' + prompt)
         with self.locked():
             rows = [self._refresh(row) for row in self.rows()]
@@ -205,9 +213,15 @@ class JobStore:
                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             instructions = instructions.replace(str(self.root) + '/<job-id>', str(work))
             (work / 'AGENTS.md').write_text(instructions.split('\n\nOwner task:')[0] + '\n')
-            argv = command or (['codex', 'exec', '--dangerously-bypass-approvals-and-sandbox', '-m', model,
-                                '-o', str(control / 'final.txt'), instructions] if backend == 'codex' else
-                               ['cursor-agent', '-p', '--force', '--model', model, '--output-format', 'text', instructions])
+            if command:
+                argv = command
+            else:
+                cli = pc.resolve_cli('codex' if backend == 'codex' else 'cursor-agent')
+                if not cli:
+                    raise JobError(f'找不到 {backend} CLI')
+                argv = pc.safe_argv(cli + (['exec', '--dangerously-bypass-approvals-and-sandbox', '-m', model,
+                                            '-o', str(control / 'final.txt'), instructions] if backend == 'codex' else
+                                           ['-p', '--force', '--model', model, '--output-format', 'text', instructions]))
             _write(control / 'command.json', dict(argv=argv, timeout=self.timeout, workdir=str(work)))
             row = dict(id=jid, room=room, chat=chat, requester=requester, prompt=prompt,
                        backend=backend, model=model, workdir=str(work), status='running',
@@ -219,7 +233,7 @@ class JobStore:
                 with (work / 'worker.log').open('ab', buffering=0) as log:
                     worker = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--worker', str(control)],
                                               cwd=work, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                              start_new_session=True, close_fds=True)
+                                              **pc.detached_popen_kwargs())
                 row.update(worker_pid=worker.pid, worker_token=process_token(worker.pid),
                            pid=worker.pid, pgid=worker.pid)
                 _write(self.path(jid), row)
@@ -341,10 +355,17 @@ def run_worker(control):
             status, code = 'cancelled', -15
         else:
             # Authentication remains available via CLI's home files, not inherited secrets.
-            env = {k: v for k, v in os.environ.items() if k in {'PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'TZ', 'TERM'} or k.startswith('LC_')}
+            keep = {'PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'TZ', 'TERM'}
+            if os.name == 'nt':
+                # CLIs find their sign-in under the profile dirs; nothing else is inherited.
+                keep |= {'SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP',
+                         'USERPROFILE', 'USERNAME', 'HOMEDRIVE', 'HOMEPATH', 'APPDATA', 'LOCALAPPDATA',
+                         'PROGRAMDATA', 'PROGRAMFILES', 'PROGRAMFILES(X86)', 'NUMBER_OF_PROCESSORS',
+                         'PROCESSOR_ARCHITECTURE'}
+            env = {k: v for k, v in os.environ.items() if k.upper() in keep or k.startswith('LC_')}
             with (Path(spec['workdir']) / 'agent.log').open('ab', buffering=0) as log:
                 proc = subprocess.Popen(spec['argv'], cwd=spec['workdir'], stdin=subprocess.DEVNULL,
-                                        stdout=log, stderr=log, start_new_session=True, close_fds=True, env=env)
+                                        stdout=log, stderr=log, env=env, **pc.detached_popen_kwargs())
                 running = dict(pid=proc.pid, pgid=proc.pid, token=process_token(proc.pid))
                 _write(control / 'running.json', running)
                 while True:
@@ -362,10 +383,7 @@ def run_worker(control):
                     if code is not None:
                         status = 'completed' if code == 0 else 'failed'
                         # Clean up processes the agent left in its group.
-                        try:
-                            os.killpg(proc.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
+                        pc.kill_tree(proc.pid, hard=True)
                         break
                     time.sleep(.1)
     except Exception as exc:

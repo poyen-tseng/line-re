@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import time
 
+import platform_compat as pc
 import send_message
 
 
@@ -30,9 +31,36 @@ def live_displays(timeout=2):
     return displays
 
 
+def _capture_windows(root):
+    """Whole virtual desktop via Pillow (ImageGrab). Display ids do not apply."""
+    try:
+        from PIL import ImageGrab
+    except ImportError as exc:
+        raise ValueError('需要 Pillow 才能在 Windows 截圖（pip install pillow）') from exc
+    directory = Path(root) / 'screenshots'
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / (time.strftime('%Y%m%d-%H%M%S-') + secrets.token_hex(4) + '.png')
+    try:
+        with send_message._ui_lock(timeout=5):
+            image = ImageGrab.grab(all_screens=True)
+        image.save(path, 'PNG')
+        if path.stat().st_size < 8 or path.read_bytes()[:8] != b'\x89PNG\r\n\x1a\n':
+            raise ValueError('擷取結果不是 PNG')
+    except OSError as exc:
+        path.unlink(missing_ok=True)
+        # A locked desktop or a disconnected session has no screen to copy.
+        raise ValueError(f'無法擷取桌面（螢幕可能已鎖定）：{exc}') from exc
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return str(path)
+
+
 def capture(root, display=':3'):
     if not isinstance(display, str) or not re.fullmatch(r':\d{1,3}(?:\.\d)?', display):
         raise ValueError('顯示器格式應為 :3 或 :1')
+    if pc.IS_WINDOWS:
+        return _capture_windows(root)
     # Validate the requested screen directly as enumeration has a global budget.
     probe = subprocess.run(['xdpyinfo', '-display', display], stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL, timeout=2)

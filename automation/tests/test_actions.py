@@ -8,6 +8,8 @@ import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from platform_support import needs_symlinks  # noqa: E402
 import group_actions as ga
 
 ROOM = 'c' + '3' * 32
@@ -37,6 +39,7 @@ class ActionTests(unittest.TestCase):
         self.assertEqual(ga.parse_at((now + timedelta(minutes=1)).isoformat(), now)[1], None)
         self.assertIsNotNone(ga.parse_at('9999-12-31T23:59:59-23:59', now)[1])
 
+    @needs_symlinks
     def test_file_search_and_resolve_reject_symlinks_and_ambiguous_names(self):
         with tempfile.TemporaryDirectory() as root:
             Path(root, 'a').mkdir()

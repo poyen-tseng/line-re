@@ -27,6 +27,11 @@ This module is the single home for code that more than one of
     LineApplication and AllInOneWindow UTF-16 fields, plus
     `find_outgoing_copies` for the post-send `to` check.
 
+Platforms: Linux/Wine reads `/proc/<pid>/mem`. Native Windows LINE
+Desktop uses `OpenProcess` + `ReadProcessMemory` (`open_process_mem`,
+`iter_readable_regions`); both expose the same seek/read interface, so
+every parser above is shared. Access is read-only on both.
+
 The older scripts import from this module so their internals are not
 duplicated; they continue to work standalone exactly as before.
 """
@@ -39,6 +44,15 @@ import subprocess
 import tempfile
 import time
 from datetime import datetime, timezone, timedelta
+
+import platform_compat as pc
+
+# Native Win32 structures are defined only on Windows. Code paths branch on
+# `pc.IS_WINDOWS` at call time, so tests can exercise the Linux path anywhere.
+_NT = os.name == "nt"
+if _NT:
+    import ctypes
+    import ctypes.wintypes as _wt
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -124,15 +138,59 @@ def is_line_cmdline(raw):
     return "line.exe" in names and "run" in argv and "-t" in argv
 
 
-def find_line_pid(preferred=None):
-    """Find the LINE.exe PID by scanning `/proc`.
+def _find_windows_line_pids():
+    """Running native LINE.exe PIDs (Toolhelp snapshot), oldest first."""
+    class _PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", _wt.DWORD),
+            ("cntUsage", _wt.DWORD),
+            ("th32ProcessID", _wt.DWORD),
+            ("th32DefaultHeapID", ctypes.c_void_p),
+            ("th32ModuleID", _wt.DWORD),
+            ("cntThreads", _wt.DWORD),
+            ("th32ParentProcessID", _wt.DWORD),
+            ("pcPriClassBase", _wt.LONG),
+            ("dwFlags", _wt.DWORD),
+            ("szExeFile", _wt.WCHAR * 260),
+        ]
 
-    Matches processes whose cmdline contains both `LINE.exe` and
-    `run -t` (the LINE Desktop launcher form). If `preferred` is given
-    and still alive + matches, returns it without a full scan.
+    k32 = ctypes.windll.kernel32
+    k32.CreateToolhelp32Snapshot.restype = _wt.HANDLE
+    snap = k32.CreateToolhelp32Snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
+    if not snap or snap == _wt.HANDLE(-1).value:
+        return []
+    found = []  # (pid, parent)
+    try:
+        entry = _PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+        ok = k32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            if entry.szExeFile.lower() == "line.exe":
+                found.append((int(entry.th32ProcessID), int(entry.th32ParentProcessID)))
+            ok = k32.Process32NextW(snap, ctypes.byref(entry))
+    finally:
+        k32.CloseHandle(snap)
+    # LINE may spawn LINE.exe helpers; the main client is not a child of another.
+    pids = {pid for pid, _parent in found}
+    roots = [pid for pid, parent in found if parent not in pids]
+    return roots or [pid for pid, _parent in found]
+
+
+def find_line_pid(preferred=None):
+    """Find the LINE.exe PID.
+
+    Linux/Wine: scan `/proc` for a cmdline containing both `LINE.exe` and
+    `run -t` (the LINE Desktop launcher form). Windows: the native
+    LINE.exe process. If `preferred` is given and still alive + matches,
+    returns it without a full scan.
 
     Returns int PID, or None if not found.
     """
+    if pc.IS_WINDOWS:
+        pids = _find_windows_line_pids()
+        if preferred and preferred in pids:
+            return preferred
+        return pids[0] if pids else None
     if preferred:
         try:
             with open(f"/proc/{preferred}/cmdline", "rb") as f:
@@ -311,6 +369,45 @@ def looks_like_message_row(vals):
     return True
 
 
+_SELF_MID_HINT = [None]
+
+
+def set_self_mid(mid):
+    """Tell the scanners which account is running (see `own_message_sender`)."""
+    _SELF_MID_HINT[0] = mid if isinstance(mid, str) and MID_RE.fullmatch(mid) else None
+
+
+def self_mid_hint():
+    """This account's mid: `set_self_mid`, else bot_config, else None."""
+    if _SELF_MID_HINT[0] is None:
+        try:
+            import bot_config  # local import: bot_config imports this module
+            mid = bot_config.BotConfig().bot_mid()
+            if mid != bot_config.DEFAULT_BOT_MID:
+                _SELF_MID_HINT[0] = mid
+        except Exception:
+            return None
+    return _SELF_MID_HINT[0]
+
+
+# Native Windows LINE 26.6 stores this account's own outgoing `_message`
+# rows with `_from` = '' (the sender is implicit). Column 20 of the 36-column
+# row sometimes still carries the mid; otherwise it is this account.
+_OWN_FROM_COL = 20
+
+
+def normalize_own_row(vals):
+    """Return `vals` with an empty own `_from` filled in, or unchanged."""
+    if (len(vals) >= 36 and vals[MSG_FROM] == "" and isinstance(vals[MSG_TO], str)
+            and MID_RE.fullmatch(vals[MSG_TO])):
+        alt = vals[_OWN_FROM_COL]
+        frm = alt if isinstance(alt, str) and MID_RE.fullmatch(alt) else self_mid_hint()
+        if frm:
+            vals = list(vals)
+            vals[MSG_FROM] = frm
+    return vals
+
+
 def looks_like_contact_row(vals):
     """Heuristic: does this parsed row look like a `_contact` record?"""
     if len(vals) <= CT_DISPLAYNAME_OVERRIDDEN:
@@ -318,7 +415,31 @@ def looks_like_contact_row(vals):
     mid = vals[CT_MID]
     if not isinstance(mid, str) or not MID_RE.fullmatch(mid):
         return False
+    for col in (CT_DISPLAYNAME, CT_DISPLAYNAME_OVERRIDDEN):
+        if vals[col] is not None and not isinstance(vals[col], str):
+            return False
+    # LINE 26.6 keeps a lookup blob ('{"_lkp|...') in a row of the same shape.
+    over = vals[CT_DISPLAYNAME_OVERRIDDEN]
+    if isinstance(over, str) and over.lstrip().startswith('{"_lkp|'):
+        return False
     return True
+
+
+# LINE 26.6 (Windows) contact rows may leave both display-name columns empty
+# and keep the name in a JSON profile blob at column 23.
+_CT_PROFILE_JSON = 23
+
+
+def contact_row_name(vals):
+    name = vals[CT_DISPLAYNAME_OVERRIDDEN] or vals[CT_DISPLAYNAME]
+    if (not name and len(vals) > _CT_PROFILE_JSON
+            and isinstance(vals[_CT_PROFILE_JSON], str)
+            and vals[_CT_PROFILE_JSON].lstrip().startswith("{")):
+        try:
+            name = json.loads(vals[_CT_PROFILE_JSON]).get("profileName")
+        except (ValueError, TypeError, AttributeError):
+            name = None
+    return name if isinstance(name, str) and name else None
 
 
 def looks_like_group_chat_row(vals):
@@ -357,10 +478,12 @@ def looks_like_group_chat_row(vals):
         return False
     if not isinstance(status, int) or not (0 <= status <= 10):
         return False
-    if not isinstance(added, int) or not (1262304000000 < added < 2050000000000):
+    # Windows LINE 26.6 leaves _addedTime 0 and _inviterMId '' for some rooms.
+    if not isinstance(added, int) or not (
+            added == 0 or 1262304000000 < added < 2050000000000):
         return False
-    if not (isinstance(inviter, str) and inviter.startswith("u")
-            and MID_RE.fullmatch(inviter)):
+    if not (isinstance(inviter, str) and (inviter == "" or (
+            inviter.startswith("u") and MID_RE.fullmatch(inviter)))):
         return False
     return True
 
@@ -506,8 +629,113 @@ def atomic_write_text(path, text):
 # Process memory scanning
 # ---------------------------------------------------------------------------
 
+if _NT:
+    class _MBI64(ctypes.Structure):
+        _fields_ = [
+            ("BaseAddress", ctypes.c_ulonglong),
+            ("AllocationBase", ctypes.c_ulonglong),
+            ("AllocationProtect", _wt.DWORD),
+            ("PartitionId", _wt.WORD),
+            ("RegionSize", ctypes.c_ulonglong),
+            ("State", _wt.DWORD),
+            ("Protect", _wt.DWORD),
+            ("Type", _wt.DWORD),
+        ]
+
+    _PROCESS_VM_READ = 0x0010
+    _PROCESS_QUERY_INFORMATION = 0x0400
+    _K32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _K32.OpenProcess.restype = _wt.HANDLE
+    _K32.OpenProcess.argtypes = [_wt.DWORD, _wt.BOOL, _wt.DWORD]
+    _K32.CloseHandle.argtypes = [_wt.HANDLE]
+    _K32.ReadProcessMemory.argtypes = [_wt.HANDLE, ctypes.c_ulonglong, ctypes.c_void_p,
+                                       ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+    _K32.ReadProcessMemory.restype = _wt.BOOL
+    _K32.VirtualQueryEx.argtypes = [_wt.HANDLE, ctypes.c_ulonglong,
+                                    ctypes.POINTER(_MBI64), ctypes.c_size_t]
+    _K32.VirtualQueryEx.restype = ctypes.c_size_t
+
+
+class _WinProcessMem:
+    """Read-only `seek`/`read` view of another process (ReadProcessMemory).
+
+    Mirrors `open('/proc/<pid>/mem', 'rb')` so the scanners need no branch.
+    Opened with VM_READ | QUERY_INFORMATION only; it cannot write.
+    """
+
+    def __init__(self, pid):
+        self._h = _K32.OpenProcess(_PROCESS_VM_READ | _PROCESS_QUERY_INFORMATION,
+                                   False, int(pid))
+        if not self._h:
+            raise OSError(f"OpenProcess failed for PID {pid} "
+                          f"(error {ctypes.get_last_error()})")
+        self._pos = 0
+
+    def seek(self, addr):
+        self._pos = int(addr)
+
+    def read(self, n):
+        if not self._h or n <= 0:
+            return b""
+        buf = ctypes.create_string_buffer(n)
+        got = ctypes.c_size_t(0)
+        ok = _K32.ReadProcessMemory(self._h, self._pos, buf, n, ctypes.byref(got))
+        if not ok and got.value == 0:
+            raise OSError(f"ReadProcessMemory failed at {self._pos:#x}")
+        self._pos += got.value
+        return buf.raw[:got.value]
+
+    def close(self):
+        if self._h:
+            _K32.CloseHandle(self._h)
+            self._h = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def open_process_mem(pid):
+    """Read-only seekable handle on LINE's memory (Linux or Windows)."""
+    if pc.IS_WINDOWS:
+        return _WinProcessMem(pid)
+    return open(f"/proc/{pid}/mem", "rb", buffering=0)
+
+
+def _iter_windows_regions(pid, writable_only):
+    """Committed, readable, private/mapped (not image) regions via VirtualQueryEx."""
+    readable = ({0x04, 0x08, 0x40, 0x80} if writable_only
+                else {0x02, 0x04, 0x08, 0x20, 0x40, 0x80})
+    handle = _K32.OpenProcess(_PROCESS_QUERY_INFORMATION, False, int(pid))
+    if not handle:
+        return
+    try:
+        info = _MBI64()
+        addr = 0
+        while addr < 0x7FFFFFFFFFFF:
+            if not _K32.VirtualQueryEx(handle, addr, ctypes.byref(info), ctypes.sizeof(info)):
+                break
+            nxt = info.BaseAddress + info.RegionSize
+            if nxt <= addr:
+                break
+            addr = nxt
+            if (info.State == 0x1000                      # MEM_COMMIT
+                    and (info.Protect & 0xFF) in readable
+                    and not info.Protect & 0x100          # PAGE_GUARD
+                    and info.Type != 0x1000000            # MEM_IMAGE (code/DLLs)
+                    and 0 < info.RegionSize <= 256 * 1024 * 1024):
+                yield info.BaseAddress, info.BaseAddress + info.RegionSize, ""
+    finally:
+        _K32.CloseHandle(handle)
+
+
 def iter_readable_regions(pid, writable_only=False):
     """Yield (start, end, desc) for readable, non-code regions of pid."""
+    if pc.IS_WINDOWS:
+        yield from _iter_windows_regions(pid, writable_only)
+        return
     try:
         with open(f"/proc/{pid}/maps") as f:
             maps = f.read().splitlines()
@@ -940,6 +1168,49 @@ def _collect_sql_groups(data, groups):
             _remember_group(groups, fields.get("_chatMid"), fields.get("_chatName") or "")
 
 
+def _collect_profile_names(data, self_mid, self_names):
+    """This account's live display name from a cached `getProfile` reply.
+
+    The Thrift compact struct is `getProfile`, then field 1 (mid, string),
+    then field 20 (displayName) as 0x88 <len> <utf-8> followed by 0x28.
+    Used only so a renamed bot still strips `@<new name>` from commands;
+    acceptance itself is by MENTION metadata mid.
+    """
+    if not self_mid:
+        return
+    marker = b"getProfile\x0c\x00\x1c\x18!" + self_mid.encode("ascii")
+    idx = 0
+    while True:
+        i = data.find(marker, idx)
+        if i < 0:
+            return
+        idx = i + len(marker)
+        window = data[idx:idx + 200]
+        p = 0
+        while True:
+            j = window.find(b"\x88", p)
+            if j < 0 or j + 2 >= len(window):
+                break
+            p = j + 1
+            n = window[j + 1]
+            if not 1 <= n <= 120 or j + 2 + n >= len(window) or window[j + 2 + n] != 0x28:
+                continue
+            try:
+                name = window[j + 2:j + 2 + n].decode("utf-8", "strict").strip()
+            except UnicodeDecodeError:
+                continue
+            if name and not any(ord(ch) < 32 for ch in name):
+                if name not in self_names:
+                    self_names.append(name)
+                break
+
+
+def _note_self_name(self_names, name):
+    name = name.strip() if isinstance(name, str) else ""
+    if name and name not in self_names:
+        self_names.append(name)
+
+
 def scan_memory(pid):
     """Scan process memory for messages and contacts.
 
@@ -966,13 +1237,16 @@ def scan_memory(pid):
     groups = {}
     chats = {}
     options = {}
+    self_names = []
+    self_mid = self_mid_hint()
     pages_scanned = 0
     pages_matched = 0
     try:
-        mem = open(f"/proc/{pid}/mem", "rb", buffering=0)
+        mem = open_process_mem(pid)
     except OSError:
         scan_memory.last_groups = {}
         scan_memory.last_chat_order = []
+        scan_memory.self_names = []
         scan_memory.last_pid = pid
         scan_memory.last_at = time.monotonic()
         raise
@@ -1002,6 +1276,7 @@ def scan_memory(pid):
                     continue
                 pages_matched += 1
                 for rowid, vals in rows:
+                    vals = normalize_own_row(vals)
                     if looks_like_message_row(vals):
                         mid = vals[MSG_ID]
                         if mid:
@@ -1018,18 +1293,35 @@ def scan_memory(pid):
                         options[vals[OPT_ID]] = (vals[OPT_HIDDEN], vals[OPT_PINNED])
                     elif looks_like_contact_row(vals):
                         cmid = vals[CT_MID]
-                        name = vals[CT_DISPLAYNAME_OVERRIDDEN] or vals[CT_DISPLAYNAME]
-                        if cmid and isinstance(name, str) and name:
-                            contacts.setdefault(cmid, name)
+                        name = contact_row_name(vals)
+                        if cmid and name:
+                            if self_mid and cmid.lower() == self_mid.lower():
+                                _note_self_name(self_names, name)
+                                contacts[cmid] = name
+                            else:
+                                contacts.setdefault(cmid, name)
                     elif looks_like_group_chat_row(vals):
                         _remember_group(
                             groups, vals[1],
                             vals[5] if isinstance(vals[5], str) else "")
+                    elif (pc.IS_WINDOWS and len(vals) == 16
+                          and isinstance(vals[4], str) and MID_RE.fullmatch(vals[4])
+                          and vals[4][0] == "u"
+                          and isinstance(vals[2], str) and vals[2].strip()):
+                        # LINE 26.6 group-member row: name at 2, member mid at 4.
+                        cmid, name = vals[4], vals[2]
+                        if self_mid and cmid.lower() == self_mid.lower():
+                            _note_self_name(self_names, name)
+                        contacts.setdefault(cmid, name)
             _collect_json_messages(data, messages)
             _collect_sql_messages(data, messages)
             _collect_sql_groups(data, groups)
+            _collect_profile_names(data, self_mid, self_names)
     finally:
         mem.close()
+    if self_mid and self_names:
+        # The live profile reply is the freshest name after a rename.
+        contacts[self_mid] = self_names[-1]
     # A restarted/partial cache can identify a joined room without loading its
     # _groupChat name. Reuse its persisted name for both routing and discovery.
     # Only enrich rooms actually found in this scan; do not resurrect old rooms.
@@ -1043,6 +1335,7 @@ def scan_memory(pid):
             contacts[mid] = name
     scan_memory.last_groups = dict(groups)
     scan_memory.last_chat_order = _ordered_chats(chats, options)
+    scan_memory.self_names = list(self_names)
     scan_memory.last_pid = pid
     scan_memory.last_at = time.monotonic()
     # Import here because reply_context uses this module's parsers. Keep the
@@ -1091,10 +1384,19 @@ def chat_list_mids(pid, max_age=20):
 
 _OPEN_CHAT_ANCHORS = (
     # rtti name, name RVA, primary vtable RVA, mid-pointer offset
+    # LINE 26.0.2.3828 (Wine)
     (b".?AVLineApplication@@", 0x3993E88, 0x281D188, 0xAD8),
     (b".?AVAllInOneWindow@@", 0x3964758, 0x26DCEE8, 0x1048),
 )
+# LINE 26.6.0.4004 (native Windows): same two fields, recovered the same way
+# (RTTI name -> COL -> vtable, then the 33-char UTF-16 mid QString).
+_OPEN_CHAT_ANCHORS_26_6 = (
+    (b".?AVLineApplication@@", 0x39617C0, 0x294FEB8, 0xB08),
+    (b".?AVAllInOneWindow@@", 0x39437D8, 0x28AFC00, 0x1060),
+)
+_OPEN_CHAT_ANCHOR_SETS = (_OPEN_CHAT_ANCHORS, _OPEN_CHAT_ANCHORS_26_6)
 _open_chat_cache = {}  # pid -> (image_base, [(obj, offset, vtable), ...])
+_anchor_set_cache = {}  # pid -> anchor tuple that matched this image
 
 
 def _mem_read(mem, addr, n):
@@ -1114,36 +1416,85 @@ def _mem_u64(mem, addr):
     return struct.unpack("<Q", raw)[0]
 
 
+def _windows_module_base(pid, module_name="line.exe"):
+    """Load address of LINE.exe in `pid` (ASLR moves it on Windows)."""
+    if not pc.IS_WINDOWS:
+        return None
+
+    class _MODULEENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", _wt.DWORD),
+            ("th32ModuleID", _wt.DWORD),
+            ("th32ProcessID", _wt.DWORD),
+            ("GlblcntUsage", _wt.DWORD),
+            ("ProccntUsage", _wt.DWORD),
+            ("modBaseAddr", ctypes.c_void_p),
+            ("modBaseSize", _wt.DWORD),
+            ("hModule", _wt.HMODULE),
+            ("szModule", _wt.WCHAR * 256),
+            ("szExePath", _wt.WCHAR * 260),
+        ]
+
+    k32 = ctypes.windll.kernel32
+    k32.CreateToolhelp32Snapshot.restype = _wt.HANDLE
+    snap = k32.CreateToolhelp32Snapshot(0x00000018, int(pid))  # MODULE | MODULE32
+    if not snap or snap == _wt.HANDLE(-1).value:
+        return None
+    try:
+        entry = _MODULEENTRY32W()
+        entry.dwSize = ctypes.sizeof(_MODULEENTRY32W)
+        ok = k32.Module32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            if entry.szModule.lower() == module_name:
+                return int(entry.modBaseAddr or 0) or None
+            ok = k32.Module32NextW(snap, ctypes.byref(entry))
+    finally:
+        k32.CloseHandle(snap)
+    return None
+
+
+def _anchors_match(mem, base, anchors):
+    return base and all(_mem_read(mem, base + rva, len(name)) == name
+                        for name, rva, _vt, _off in anchors)
+
+
+def _image_base_and_anchors(pid, mem):
+    """(PE base, anchor set) for the running LINE build, or (None, None)."""
+    # Check the known module base first (Wine: PE preferred base; Windows:
+    # the ASLR load address) before scanning the whole process (~4 seconds).
+    candidates = [b for b in (_windows_module_base(pid), 0x140000000) if b]
+    for base in candidates:
+        for anchors in _OPEN_CHAT_ANCHOR_SETS:
+            if _anchors_match(mem, base, anchors):
+                return base, anchors
+    for anchors in _OPEN_CHAT_ANCHOR_SETS:
+        token, rva, _vt, _off = anchors[0]
+        for start, end, _desc in iter_readable_regions(pid):
+            if end <= 0x100000000:
+                continue
+            try:
+                mem.seek(start)
+                data = mem.read(end - start)
+            except OSError:
+                continue
+            idx = 0
+            while True:
+                i = data.find(token, idx)
+                if i < 0:
+                    break
+                base = (start + i) - rva
+                if base > 0 and _anchors_match(mem, base, anchors):
+                    return base, anchors
+                idx = i + 1
+    return None, None
+
+
 def _image_base(pid, mem):
     """PE base of the LINE image that holds the RTTI names, or None."""
-    # This Wine build normally maps at its PE preferred base. Check all build
-    # anchors directly before scanning the whole process (formerly ~4 seconds).
-    preferred = 0x140000000
-    if all(_mem_read(mem, preferred + rva, len(name)) == name
-           for name, rva, _vt, _off in _OPEN_CHAT_ANCHORS):
-        return preferred
-    token, rva, _vt, _off = _OPEN_CHAT_ANCHORS[0]
-    for start, end, _desc in iter_readable_regions(pid):
-        if end <= 0x100000000:
-            continue
-        try:
-            mem.seek(start)
-            data = mem.read(end - start)
-        except OSError:
-            continue
-        idx = 0
-        while True:
-            i = data.find(token, idx)
-            if i < 0:
-                break
-            base = (start + i) - rva
-            if base > 0 and all(
-                _mem_read(mem, base + name_rva, len(name)) == name
-                for name, name_rva, _v, _o in _OPEN_CHAT_ANCHORS
-            ):
-                return base
-            idx = i + 1
-    return None
+    base, anchors = _image_base_and_anchors(pid, mem)
+    if base is not None:
+        _anchor_set_cache[pid] = anchors
+    return base
 
 
 def _read_mid_field(mem, obj, offset):
@@ -1171,7 +1522,8 @@ def _locate_open_chat(pid, mem):
         return None
     # Find both anchors in one pass. bytes.find on the pointer patterns across
     # two full heap passes cost ~4s; a literal regex scan takes a fraction of it.
-    anchors = [(base + vt_rva, offset) for _n, _r, vt_rva, offset in _OPEN_CHAT_ANCHORS]
+    anchor_set = _anchor_set_cache.get(pid, _OPEN_CHAT_ANCHORS)
+    anchors = [(base + vt_rva, offset) for _n, _r, vt_rva, offset in anchor_set]
     needles = {struct.pack('<Q', vt): (vt, offset) for vt, offset in anchors}
     pattern = re.compile(b'|'.join(re.escape(needle) for needle in needles))
     objects = {vt: set() for vt, _offset in anchors}
@@ -1196,7 +1548,7 @@ def current_open_chat_mid(pid):
     if not pid:
         return None
     try:
-        mem = open(f"/proc/{pid}/mem", "rb", buffering=0)
+        mem = open_process_mem(pid)
     except OSError:
         return None
     try:

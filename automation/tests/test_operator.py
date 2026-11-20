@@ -10,6 +10,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from platform_support import linux_path  # noqa: E402
 import bot_config as bc
 import group_actions as ga
 import operator_commands as commands
@@ -73,6 +75,7 @@ class OperatorParsingTests(unittest.TestCase):
             with self.assertRaises(bc.ConfigError):
                 config.is_admin(bc.DEFAULT_ADMIN)
 
+    @linux_path
     def test_capture_lock_and_png(self):
         with tempfile.TemporaryDirectory() as root:
             def run(argv, **kwargs):

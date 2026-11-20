@@ -91,7 +91,7 @@ def widget_global(mem, obj):
 class ReactionMemory:
     def __init__(self, pid):
         self.pid = pid
-        self.mem = open(f'/proc/{pid}/mem', 'rb', buffering=0)
+        self.mem = lc.open_process_mem(pid)
         try:
             cached = lc._open_chat_cache.get(pid)
             self.base = cached[0] if cached else lc._image_base(pid, self.mem)
@@ -288,7 +288,7 @@ def reaction_evidence(pid, message_id, room, self_mid):
     ack = False
     identity = False
     clicks, completions = [], []
-    with open(f'/proc/{pid}/mem', 'rb', buffering=0) as mem:
+    with lc.open_process_mem(pid) as mem:
         for addr, blob in chunks(pid, mem):
             rows, ok = evidence_from_blob(blob, message_id, room, self_mid)
             for row in rows:

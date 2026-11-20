@@ -8,6 +8,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from platform_support import linux_path  # noqa: E402
 import line_common as lc
 import line_cli as cli
 import read_messages as reader
@@ -28,6 +30,7 @@ def metadata(**changes):
     return result
 
 
+@linux_path
 class ReplyParsingTests(unittest.TestCase):
     def test_observed_metadata_strings_and_numeric_columns(self):
         for meta in (metadata(), json.dumps(metadata())):
@@ -101,6 +104,7 @@ def original(**changes):
     return row
 
 
+@linux_path
 class ReplyLookupTests(unittest.TestCase):
     def setUp(self):
         cache = patch.object(replies, 'CACHE', replies.MessageCache())
