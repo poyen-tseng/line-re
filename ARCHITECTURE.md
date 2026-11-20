@@ -1,6 +1,7 @@
 # Architecture
 
-Local automation around the author's own LINE Desktop client (Wine).
+Local automation around the author's own LINE Desktop client (Wine on
+Linux, or the native Windows client; see WINDOWS.md).
 It does not ship account ids, chat logs, or infrastructure details.
 Real mids and the mention name come from `automation/bot_config.json`
 or the environment; see `automation/bot_config.example.json`.
@@ -34,6 +35,8 @@ or the environment; see `automation/bot_config.example.json`.
   core sync socket and, when enabled, restart the local client.
 - `re-file-send/`, `re-reaction/`, `re-reply/` — research notes and
   read-only probes for uploads, reactions, and quote replies.
+- `automation/platform_compat.py` and `automation/win_line.py` — OS shims
+  and the Windows UI Automation driver used when running on Windows.
 - `automation/tools/` — optional socket and keepalive experiments.
   They do not send chat messages.
 

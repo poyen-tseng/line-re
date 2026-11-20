@@ -14,3 +14,4 @@ placeholder defaults.
 
 - [Architecture](ARCHITECTURE.md) — components, data flow, and limitations
 - [automation/README.md](automation/README.md) — how to run the tools
+- [WINDOWS.md](WINDOWS.md) — native Windows LINE Desktop support

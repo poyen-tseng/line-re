@@ -141,7 +141,7 @@ class RowQuirkTests(unittest.TestCase):
 
     def test_group_row_without_added_time_or_inviter(self):
         now = 1_800_000_000_000
-        vals = [0, ROOM, now, 0, 0, '貓貓', '', '', 0, 0, '']
+        vals = [0, ROOM, now, 0, 0, '測試群組', '', '', 0, 0, '']
         self.assertTrue(lc.looks_like_group_chat_row(vals))
 
     def test_profile_name_capture(self):
