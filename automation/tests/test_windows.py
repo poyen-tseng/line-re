@@ -356,6 +356,39 @@ class WinLineTests(unittest.TestCase):
                 win_line.stage_copy(str(src), 2)
 
 
+class LikeHelperTests(unittest.TestCase):
+    def test_message_row_must_be_unique(self):
+        els = [{'role': 'Text', 'label': '小明, @Bot  工作\n狀態, 上午 1:57'},
+               {'role': 'Text', 'label': '小華, @Bot 工作 狀態, 上午 1:58'},
+               {'role': 'Text', 'label': '@Bot 工作 狀態, 上午 1:59, 已讀 1'}]
+        self.assertIs(win_line.find_message_row(els, '小明', '@Bot 工作 狀態'), els[0])
+        self.assertIsNone(win_line.find_message_row(els + [els[0]], '小明', '@Bot 工作 狀態'))
+        self.assertIsNone(win_line.find_message_row(els, '', '@Bot'))
+
+    def test_leftmost_blob_skips_later_changes(self):
+        from PIL import Image
+        a = Image.new('RGB', (100, 40))
+        b = a.copy()
+        for x in range(10, 30):
+            for y in range(5, 25):
+                b.putpixel((x, y), (255, 255, 255))
+        for x in range(60, 90):
+            b.putpixel((x, 10), (255, 255, 255))
+        self.assertEqual(win_line._leftmost_blob(a, b, (0, 0, 100, 40)), (10, 5, 29, 24))
+        self.assertIsNone(win_line._leftmost_blob(a, a, (0, 0, 100, 40)))
+
+    def test_like_never_clicks_when_locked_or_user_active(self):
+        with patch.object(win_line, 'desktop_locked', return_value=True), \
+                patch.object(win_line, 'main_window', side_effect=AssertionError('touched UI')):
+            self.assertFalse(win_line.like_hover(1, ROOM, 'a', 'b', lambda: None)[0])
+        with patch.object(win_line, 'desktop_locked', return_value=False), \
+                patch.object(win_line, 'idle_seconds', return_value=3), \
+                patch.object(win_line, 'main_window', side_effect=AssertionError('touched UI')):
+            committed, detail = win_line.like_hover(1, ROOM, 'a', 'b', lambda: None)
+        self.assertFalse(committed)
+        self.assertIn('active', detail)
+
+
 class NetworkTimeTests(unittest.TestCase):
     def test_note_only_when_clock_is_off(self):
         from datetime import datetime, timedelta

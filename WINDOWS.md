@@ -16,7 +16,7 @@ branches on `platform_compat.IS_WINDOWS`.
 | Sync watchdog | `ss`, restart Bottles tree | `netstat`; "restart" only re-shows LINE (never kills it) |
 | Screenshot | ImageMagick `import` | Pillow `ImageGrab` |
 | Coding jobs | process groups, signals | detached process group, `taskkill /T`, creation-time identity |
-| Likes | X11 hover + pixel check | needs an unlocked, idle desktop (see below) |
+| Likes | X11 hover + pixel check | real-cursor hover + capture diff on an unlocked, idle desktop |
 
 Text sends, uploads, quote lookups and operator commands also work while the
 Windows session is **locked**: they use UI Automation patterns, key
@@ -61,5 +61,9 @@ python line_cli.py ai --group-bot --include-dm --dm-without-mention `
 
 LINE draws its reaction button only while the real mouse cursor hovers a
 message; Qt ignores synthesized background mouse input and UIA exposes no
-reaction control. Likes are therefore skipped (logged, never clicked) while
-the desktop is locked.
+reaction control. The Windows liker therefore runs only on an unlocked
+desktop whose user has been idle for `LINE_LIKE_MIN_IDLE` seconds (default
+30): it hovers the message row found in the UIA list, finds the smiley and
+then the 👍 icon by diffing window captures, clicks them with the real
+cursor (restored afterwards) and confirms the reaction in memory. While the
+desktop is locked or in use, likes are skipped and logged, never clicked.

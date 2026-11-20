@@ -272,7 +272,40 @@ def like_message_windows(message, chat_name, self_mid, preempt):
     import win_line
     if win_line.desktop_locked():
         return Result(detail='desktop locked: LINE reactions need a real mouse hover; skipped')
-    return Result(detail='windows like: interactive hover path not enabled; skipped')
+    mid, room = message['id'], message['to']
+    pid = lc.find_line_pid()
+    if not pid:
+        return Result(detail='LINE is not running')
+    try:
+        if rm.reaction_evidence(pid, mid, room, self_mid)['records']:
+            return Result(ok=True, committed=True, detail='existing self NICE in memory; no click')
+        _msgs, contacts, _s, _m = lc.scan_memory(pid)
+        sender = contacts.get(message.get('from'))
+        min_idle = float(os.environ.get('LINE_LIKE_MIN_IDLE', '30'))
+
+        def guard():
+            if preempt.is_set():
+                raise TimeoutError('yielding UI to reply')
+            if lc.current_open_chat_mid(pid) != room:
+                raise ValueError('open room changed or is unknown')
+
+        with sm._ui_lock(timeout=0.5), win_line.session():
+            committed, detail = win_line.like_hover(pid, room, sender, message.get('text'),
+                                                     guard, min_idle=min_idle,
+                                                     log=lambda *a, **k: None)
+    except (OSError, ValueError, TimeoutError, RuntimeError) as exc:
+        return Result(detail=str(exc))
+    if not committed:
+        return Result(detail=detail)
+    until = time.monotonic() + 8
+    while True:
+        evidence = rm.reaction_evidence(pid, mid, room, self_mid)
+        if evidence['confirmed']:
+            return Result(True, True, 'NICE=2 self=' + self_mid + ' room=' + room
+                          + ' evidence=' + evidence['records'][0]['source'])
+        if time.monotonic() >= until:
+            return Result(committed=True, detail='click sent; memory confirmation unavailable')
+        time.sleep(0.5)
 
 
 @dataclass

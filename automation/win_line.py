@@ -794,6 +794,134 @@ def idle_seconds():
 
 
 # ---------------------------------------------------------------------------
+# Likes (needs a real cursor: unlocked, idle desktop)
+# ---------------------------------------------------------------------------
+#
+# LINE 26.6 draws a smiley button right of a bubble only while the real
+# cursor hovers the message; clicking it shows the reaction picker (👍 first)
+# above the bubble. Neither is in the UIA tree and Qt ignores posted mouse
+# messages, so both are located by diffing window captures and clicked with
+# the real cursor, which is put back afterwards.
+
+def _capture(pid, hwnd):
+    import base64
+    import io
+    from PIL import Image
+    els, state = elements(pid, hwnd, max_elements=1500, screenshot=True)
+    raw = base64.b64decode(state["screenshot_png_b64"])
+    return els, Image.open(io.BytesIO(raw)).convert("RGB")
+
+
+def _leftmost_blob(a, b, box, threshold=40):
+    """(x0, y0, x1, y1) of the leftmost changed blob inside `box`, or None."""
+    from PIL import ImageChops
+    box = tuple(int(v) for v in box)
+    diff = ImageChops.difference(a.crop(box), b.crop(box)).convert("L")
+    px = diff.point(lambda v: 255 if v > threshold else 0).load()
+    width, height = diff.size
+    cols = [x for x in range(width) if any(px[x, y] for y in range(height))]
+    if not cols:
+        return None
+    run = [cols[0]]
+    for x in cols[1:]:
+        if x - run[-1] > 2:
+            break
+        run.append(x)
+    rows = [y for y in range(height) if any(px[x, y] for x in range(run[0], run[-1] + 1))]
+    return box[0] + run[0], box[1] + rows[0], box[0] + run[-1], box[1] + rows[-1]
+
+
+def _snippet(text):
+    return " ".join((text or "").split())[:30]
+
+
+def find_message_row(els, sender_name, text):
+    """The single UIA list item for this message, or None when ambiguous."""
+    snip = _snippet(text)
+    if not snip or not sender_name:
+        return None
+    hits = [e for e in els if e.get("role") == "Text"
+            and (e.get("label") or "").startswith(sender_name + ", ")
+            and snip in " ".join((e.get("label") or "").split())]
+    return hits[0] if len(hits) == 1 else None
+
+
+def like_hover(pid, room, sender_name, text, guard, min_idle=30.0, log=print):
+    """Like one visible incoming message with LINE's 👍. Returns (committed, detail).
+
+    `guard()` raises to abort (room changed, a reply wants the UI). Nothing is
+    clicked unless the desktop is unlocked and the user has been idle for
+    `min_idle` seconds. The first click only opens the picker; the second
+    (the commit) is preceded by a room check and a size check on 👍.
+    """
+    import ctypes
+    import ctypes.wintypes as wt
+    if desktop_locked():
+        return False, "desktop locked: LINE reactions need a real mouse hover; skipped"
+    if idle_seconds() < min_idle:
+        return False, f"user active in the last {min_idle:.0f}s; not taking the mouse"
+    user32 = ctypes.windll.user32
+    try:
+        user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))  # physical pixels
+    except (OSError, AttributeError):
+        pass
+    found = main_window(pid)
+    if not found:
+        return False, "no LINE window"
+    hwnd, rect = found
+    if not open_chat(pid, hwnd, rect, room, log=log):
+        return False, "cannot open verified room"
+    saved = wt.POINT()
+    user32.GetCursorPos(ctypes.byref(saved))
+
+    def press(x, y):
+        user32.SetCursorPos(int(x), int(y))
+        time.sleep(0.1)
+        user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
+        time.sleep(0.05)
+        user32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
+
+    try:
+        call("bring_to_front", {"pid": pid, "window_id": hwnd})
+        time.sleep(0.3)
+        user32.SetCursorPos(rect[0] + 5, rect[1] + (rect[3] - rect[1]) // 2)  # off the list
+        time.sleep(0.4)
+        els, base = _capture(pid, hwnd)
+        org = origin(els, rect)
+        row = find_message_row(els, sender_name, text)
+        if not row:
+            return False, "message not uniquely visible in the open chat"
+        f = row["frame"]
+        lists = [e for e in els if e.get("role") == "List" and isinstance(e.get("frame"), dict)
+                 and e["frame"]["x"] <= f["x"] < e["frame"]["x"] + e["frame"]["w"]]
+        if not lists or not (lists[0]["frame"]["y"] <= f["y"]
+                             and f["y"] + f["h"] <= lists[0]["frame"]["y"] + lists[0]["frame"]["h"]):
+            return False, "message row is outside the visible list"
+        rx, ry, rw, rh = f["x"] - org[0], f["y"] - org[1], f["w"], f["h"]
+        guard()
+        user32.SetCursorPos(int(org[0] + rx + 120), int(org[1] + ry + rh // 2))
+        time.sleep(0.7)
+        _, hover = _capture(pid, hwnd)
+        smile = _leftmost_blob(base, hover, (rx + 150, ry, rx + rw, ry + rh))
+        if not smile or not (12 <= smile[2] - smile[0] <= 40 and 12 <= smile[3] - smile[1] <= 40):
+            return False, f"reaction button not found ({smile})"
+        guard()
+        press(org[0] + (smile[0] + smile[2]) / 2, org[1] + (smile[1] + smile[3]) / 2)
+        time.sleep(0.7)
+        _, picker = _capture(pid, hwnd)
+        nice = _leftmost_blob(hover, picker, (rx, max(0, ry - 80), rx + rw, ry + 10))
+        if not nice or not (24 <= nice[2] - nice[0] <= 60 and 24 <= nice[3] - nice[1] <= 60):
+            return False, f"reaction picker not found ({nice})"
+        guard()
+        if lc.current_open_chat_mid(pid) != room:
+            return False, "room changed before the like"
+        press(org[0] + (nice[0] + nice[2]) / 2, org[1] + (nice[1] + nice[3]) / 2)
+        return True, "clicked 👍"
+    finally:
+        user32.SetCursorPos(saved.x, saved.y)
+
+
+# ---------------------------------------------------------------------------
 # Sync nudge (watchdog)
 # ---------------------------------------------------------------------------
 
